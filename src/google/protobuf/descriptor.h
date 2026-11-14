@@ -372,6 +372,8 @@ bool IsEnumFullySequential(const EnumDescriptor* enum_desc);
 
 const std::string& DefaultValueStringAsString(const FieldDescriptor* field);
 const std::string& NameOfEnumAsString(const EnumValueDescriptor* descriptor);
+PROTOBUF_EXPORT const std::string& NameOfEnumAsStringSlow(
+    const EnumValueDescriptor* descriptor);
 
 struct NameLimits {
   static constexpr int kPackageName = 511;
@@ -1690,6 +1692,11 @@ class PROTOBUF_EXPORT EnumDescriptor : private internal::SymbolBase {
 
   const FeatureSet* proto_features_;
   const FeatureSet* merged_features_;
+  // Lazily populated array of value_count_ std::string names (owned by the
+  // pool's memo table) for lock-free NameOfEnumAsString lookups, so enum values
+  // avoid eager per-value std::string allocations across large pools where most
+  // enums are never converted to names.
+  mutable std::atomic<const std::string*> value_names_;
 
   // IMPORTANT:  If you add a new field, make sure to search for all instances
   // of Allocate<EnumDescriptor>() and AllocateArray<EnumDescriptor>() in
@@ -1704,11 +1711,16 @@ class PROTOBUF_EXPORT EnumDescriptor : private internal::SymbolBase {
   friend class EnumValueDescriptor;
   friend class FileDescriptor;
   friend class DescriptorPool;
+  friend class EnumValueDescriptor;
   friend class Reflection;
   friend internal::DescriptorPoolExtensionFinder;
+  friend const std::string& internal::NameOfEnumAsString(
+      const EnumValueDescriptor* descriptor);
+  friend PROTOBUF_EXPORT const std::string& internal::NameOfEnumAsStringSlow(
+      const EnumValueDescriptor* descriptor);
 };
 
-PROTOBUF_INTERNAL_CHECK_CLASS_SIZE(EnumDescriptor, 64);
+PROTOBUF_INTERNAL_CHECK_CLASS_SIZE(EnumDescriptor, 72);
 
 // Describes an individual enum constant of a particular type.  To get the
 // EnumValueDescriptor for a given enum value, first get the EnumDescriptor
@@ -1781,8 +1793,6 @@ class PROTOBUF_EXPORT EnumValueDescriptor : private internal::SymbolBaseN<0>,
   // Allows access to GetLocationPath for annotations.
   friend class io::Printer;
   friend class compiler::cpp::Formatter;
-  friend const std::string& internal::NameOfEnumAsString(
-      const EnumValueDescriptor* descriptor);
 
   // Get the merged features that apply to this enum value.  These are specified
   // in the .proto file through the feature options in the message definition.
@@ -1798,12 +1808,13 @@ class PROTOBUF_EXPORT EnumValueDescriptor : private internal::SymbolBaseN<0>,
   // Walks up the descriptor tree to generate the source location path
   // to this descriptor from the file root.
   void GetLocationPath(std::vector<int>* output) const;
+  const std::string& GetOversizedSyntheticName(bool full) const;
 
   int number_;
-  // We keep the old-style std::string payload to support `NameOfEnumAsString`
-  // Once we start migrating Enum_Name functions to string_view we can switch
-  // this too.
-  internal::NonnullOffsetPtr<const std::string> all_names_;
+  // Packed inline into the file's flat allocation buffer alongside the other
+  // descriptor types to avoid two per-value std::string objects and heap
+  // buffers; NameOfEnumAsString lazily memoizes std::string copies per enum.
+  internal::DescriptorNames all_names_;
   internal::OffsetProtoPtr<const EnumValueOptions> options_;
   // Type can be from a different allocation when creating enums via
   // `FindEnumValueByNumberCreatingIfUnknown`.
@@ -2800,9 +2811,12 @@ class PROTOBUF_EXPORT DescriptorPool {
   friend class google::protobuf::descriptor_unittest::ValidationErrorTest;
   friend class ::google::protobuf::compiler::CommandLineInterface;
   friend class TextFormat;
+  friend class EnumValueDescriptor;
   friend Reflection;
   friend class ::google::protobuf::compiler::java::MemoizeProjection;
   friend struct ::google::protobuf::json_internal::Proto2Descriptor;
+  friend PROTOBUF_EXPORT const std::string& internal::NameOfEnumAsStringSlow(
+      const EnumValueDescriptor* descriptor);
 
   struct MemoBase {
     virtual ~MemoBase() = default;
@@ -3078,10 +3092,15 @@ PROTOBUF_DEFINE_ARRAY_ACCESSOR(EnumDescriptor, reserved_range,
 PROTOBUF_DEFINE_ACCESSOR(EnumDescriptor, reserved_name_count, int)
 
 inline absl::string_view EnumValueDescriptor::name() const {
-  return all_names_[0];
+  return ABSL_PREDICT_TRUE(!all_names_.full_name().empty())
+             ? all_names_.name()
+             : absl::string_view(GetOversizedSyntheticName(/*full=*/false));
 }
 inline absl::string_view EnumValueDescriptor::full_name() const {
-  return all_names_[1];
+  absl::string_view res = all_names_.full_name();
+  return ABSL_PREDICT_TRUE(!res.empty())
+             ? res
+             : absl::string_view(GetOversizedSyntheticName(/*full=*/true));
 }
 PROTOBUF_DEFINE_ACCESSOR(EnumValueDescriptor, number, int)
 PROTOBUF_DEFINE_ACCESSOR(EnumValueDescriptor, type, const EnumDescriptor*)
@@ -3344,7 +3363,19 @@ inline const std::string& DefaultValueStringAsString(
 
 inline const std::string& NameOfEnumAsString(
     const EnumValueDescriptor* descriptor) {
-  return descriptor->all_names_[0];
+  const EnumDescriptor* type = descriptor->type();
+  const std::string* names = type->value_names_.load(std::memory_order_acquire);
+  if (ABSL_PREDICT_TRUE(names != nullptr)) {
+    const uintptr_t byte_offset =
+        reinterpret_cast<uintptr_t>(descriptor) -
+        reinterpret_cast<uintptr_t>(type->values_.get());
+    if (ABSL_PREDICT_TRUE(byte_offset <
+                          static_cast<uintptr_t>(type->value_count_) *
+                              sizeof(EnumValueDescriptor))) {
+      return names[byte_offset / sizeof(EnumValueDescriptor)];
+    }
+  }
+  return NameOfEnumAsStringSlow(descriptor);
 }
 
 inline bool IsEnumFullySequential(const EnumDescriptor* enum_desc) {

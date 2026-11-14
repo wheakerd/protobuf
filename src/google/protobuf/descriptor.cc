@@ -2023,11 +2023,17 @@ FileDescriptorTables::FindEnumValueByNumberCreatingIfUnknown(
     // later.
     std::string enum_value_name =
         absl::StrFormat("UNKNOWN_ENUM_VALUE_%s_%d", parent->name(), number);
+    const absl::string_view scope = parent->full_name();
+    const size_t full_name_size =
+        scope.empty() ? enum_value_name.size()
+                      : scope.size() + 1 + enum_value_name.size();
+    const bool fits_packed =
+        full_name_size <= std::numeric_limits<uint16_t>::max();
     auto* pool = DescriptorPool::generated_pool();
     auto* tables = const_cast<DescriptorPool::Tables*>(pool->tables_.get());
     internal::FlatAllocator alloc;
     alloc.PlanArray<EnumValueDescriptor>(1);
-    alloc.PlanArray<std::string>(2);
+    alloc.PlanEntityNames(fits_packed ? full_name_size : 0);
 
     {
       // Must lock the pool because we will do allocations in the shared arena.
@@ -2035,12 +2041,17 @@ FileDescriptorTables::FindEnumValueByNumberCreatingIfUnknown(
       ABSL_CHECK(alloc.FinalizePlanning(tables));
     }
     EnumValueDescriptor* result = alloc.AllocateArray<EnumValueDescriptor>(1);
-    result->all_names_ = alloc.AllocateStrings(
-        enum_value_name,
-        absl::StrCat(parent->full_name(), ".", enum_value_name));
+    // When the combined full_name exceeds DescriptorNames's uint16_t limit,
+    // store an empty sentinel and lazily memoize the exact untruncated strings
+    // in GetOversizedSyntheticName().
+    result->all_names_.SetPayload(
+        fits_packed ? alloc.AllocateEntityNames(scope, enum_value_name).value()
+                    : alloc.AllocateEntityNames("", "").value());
     result->number_ = number;
     result->type_ = parent;
     result->options_ = nullptr;
+    result->proto_features_ = &FeatureSet::default_instance();
+    result->merged_features_ = &FeatureSet::default_instance();
     unknown_enum_values_by_number_.insert(result);
     return result;
   }
@@ -2676,6 +2687,64 @@ const uint32_t* EnumDescriptor::GetEnumValidationData() const {
              this, [](auto* e) { return MakeEnumValidatorData(e); })
       .data();
 }
+
+static std::vector<std::string> MakeEnumValueNames(const EnumDescriptor* desc) {
+  std::vector<std::string> names;
+  const int count = desc->value_count();
+  names.reserve(static_cast<size_t>(count));
+  for (int i = 0; i < count; ++i) {
+    names.emplace_back(desc->value(i)->name());
+  }
+  return names;
+}
+
+PROTOBUF_NOINLINE const std::string&
+EnumValueDescriptor::GetOversizedSyntheticName(bool full) const {
+  const uintptr_t byte_offset =
+      reinterpret_cast<uintptr_t>(this) -
+      reinterpret_cast<uintptr_t>(type_->values_.get());
+  if (byte_offset <
+      static_cast<uintptr_t>(type_->value_count_) * sizeof(*this)) {
+    // Only reached during error reporting for an invalid empty-named value in
+    // global scope.
+    return internal::GetEmptyStringAlreadyInited();
+  }
+  const auto& pair =
+      DescriptorPool::MemoizeProjection(this, [](const EnumValueDescriptor* v) {
+        std::string name = absl::StrFormat("UNKNOWN_ENUM_VALUE_%s_%d",
+                                           v->type_->name(), v->number_);
+        absl::string_view scope = v->type_->full_name();
+        std::string full_name =
+            scope.empty() ? name : absl::StrCat(scope, ".", name);
+        return std::pair<std::string, std::string>(std::move(name),
+                                                   std::move(full_name));
+      });
+  return full ? pair.second : pair.first;
+}
+
+namespace internal {
+PROTOBUF_NOINLINE const std::string& NameOfEnumAsStringSlow(
+    const EnumValueDescriptor* descriptor) {
+  const EnumDescriptor* type = descriptor->type();
+  const uintptr_t byte_offset =
+      reinterpret_cast<uintptr_t>(descriptor) -
+      reinterpret_cast<uintptr_t>(type->values_.get());
+  if (ABSL_PREDICT_TRUE(byte_offset <
+                        static_cast<uintptr_t>(type->value_count_) *
+                            sizeof(EnumValueDescriptor))) {
+    ABSL_DCHECK_EQ(byte_offset % sizeof(EnumValueDescriptor), 0u);
+    const std::string* names =
+        DescriptorPool::MemoizeProjection(type, MakeEnumValueNames).data();
+    type->value_names_.store(names, std::memory_order_release);
+    return names[byte_offset / sizeof(EnumValueDescriptor)];
+  }
+  // Fallback for synthetic descriptors created by
+  // FindEnumValueByNumberCreatingIfUnknown, which are not part of values_.
+  return DescriptorPool::MemoizeProjection(
+      descriptor,
+      [](const EnumValueDescriptor* v) { return std::string(v->name()); });
+}
+}  // namespace internal
 
 const EnumValueDescriptor* EnumDescriptor::FindValueByName(
     absl::string_view name) const {
@@ -4767,6 +4836,18 @@ Symbol DescriptorPool::NewPlaceholderWithMutexHeld(
     placeholder_full_name = name;
   }
 
+  constexpr absl::string_view kPlaceholderValueName = "PLACEHOLDER_VALUE";
+  const std::string::size_type dotpos = placeholder_full_name.find_last_of('.');
+  const size_t package_size = dotpos != std::string::npos ? dotpos : 0;
+  const size_t value_full_name_size =
+      package_size ? package_size + 1 + kPlaceholderValueName.size()
+                   : kPlaceholderValueName.size();
+  if (placeholder_type == PLACEHOLDER_ENUM &&
+      (placeholder_full_name.size() > std::numeric_limits<uint16_t>::max() ||
+       value_full_name_size > std::numeric_limits<uint16_t>::max())) {
+    return Symbol();
+  }
+
   // Create the placeholders.
   internal::FlatAllocator alloc;
   alloc.PlanArray<FileDescriptor>(1);
@@ -4776,7 +4857,8 @@ Symbol DescriptorPool::NewPlaceholderWithMutexHeld(
     alloc.PlanArray<EnumValueDescriptor>(1);
     // names for the descriptor.
     alloc.PlanEntityNames(placeholder_full_name.size());
-    alloc.PlanArray<std::string>(2);  // names for the value.
+    // names for the value (a sibling of the enum in the package scope).
+    alloc.PlanEntityNames(value_full_name_size);
   } else {
     alloc.PlanArray<Descriptor>(1);
     // names for the descriptor.
@@ -4787,7 +4869,6 @@ Symbol DescriptorPool::NewPlaceholderWithMutexHeld(
   }
   ABSL_CHECK(alloc.FinalizePlanning(tables_));
 
-  const std::string::size_type dotpos = placeholder_full_name.find_last_of('.');
   if (dotpos != std::string::npos) {
     placeholder_package =
         alloc.AllocateStrings(placeholder_full_name.substr(0, dotpos));
@@ -4814,6 +4895,8 @@ Symbol DescriptorPool::NewPlaceholderWithMutexHeld(
     placeholder_enum->options_ = nullptr;
     placeholder_enum->proto_features_ = &FeatureSet::default_instance();
     placeholder_enum->merged_features_ = &FeatureSet::default_instance();
+    ::new (&placeholder_enum->value_names_)
+        std::atomic<const std::string*>(nullptr);
     placeholder_enum->is_placeholder_ = true;
     placeholder_enum->is_unqualified_placeholder_ = (name[0] != '.');
 
@@ -4828,11 +4911,9 @@ Symbol DescriptorPool::NewPlaceholderWithMutexHeld(
            sizeof(*placeholder_value));
 
     // Note that enum value names are siblings of their type, not children.
-    placeholder_value->all_names_ = alloc.AllocateStrings(
-        "PLACEHOLDER_VALUE",
-        placeholder_package->empty()
-            ? "PLACEHOLDER_VALUE"
-            : absl::StrCat(*placeholder_package, ".PLACEHOLDER_VALUE"));
+    placeholder_value->all_names_.SetPayload(
+        alloc.AllocateEntityNames(*placeholder_package, kPlaceholderValueName)
+            .value());
 
     placeholder_value->number_ = 0;
     placeholder_value->type_ = placeholder_enum;
@@ -5349,10 +5430,12 @@ PROTOBUF_NOINLINE static bool ExistingFileMatchesProto(
 // enough memory and will ABSL_CHECK-fail.
 static void PlanAllocationSize(
     const RepeatedPtrField<EnumValueDescriptorProto>& values,
-    internal::FlatAllocator& alloc) {
+    size_t parent_scope_size, internal::FlatAllocator& alloc) {
   alloc.PlanArray<EnumValueDescriptor>(values.size());
-  alloc.PlanArray<std::string>(2 * values.size());  // name + full_name
   for (const auto& v : values) {
+    alloc.PlanEntityNames(parent_scope_size
+                              ? parent_scope_size + 1 + v.name().size()
+                              : v.name().size());
     if (v.has_options()) alloc.PlanArray<EnumValueOptions>(1);
   }
 }
@@ -5366,7 +5449,7 @@ static void PlanAllocationSize(
                               ? parent_scope_size + 1 + e.name().size()
                               : e.name().size());
     if (e.has_options()) alloc.PlanArray<EnumOptions>(1);
-    PlanAllocationSize(e.value(), alloc);
+    PlanAllocationSize(e.value(), parent_scope_size, alloc);
     alloc.PlanArray<EnumDescriptor::ReservedRange>(e.reserved_range_size());
     alloc.PlanArray<const std::string*>(e.reserved_name_size());
     alloc.PlanArray<std::string>(e.reserved_name_size());
@@ -6875,6 +6958,7 @@ void internal::DescriptorBuilder::BuildEnum(const EnumDescriptorProto& proto,
   result->is_placeholder_ = false;
   result->is_unqualified_placeholder_ = false;
   result->visibility_ = static_cast<uint8_t>(proto.visibility());
+  ::new (&result->value_names_) std::atomic<const std::string*>(nullptr);
 
   if (proto.value_size() == 0) {
     // We cannot allow enums with no values because this would mean there
@@ -6977,19 +7061,11 @@ void internal::DescriptorBuilder::BuildEnumValue(
     EnumValueDescriptor* result, internal::FlatAllocator& alloc) {
   // Note:  full_name for enum values is a sibling to the parent's name, not a
   //   child of it.
-  std::string full_name;
-  size_t scope_len = parent->full_name().size() - parent->name().size();
-  full_name.reserve(scope_len + proto.name().size());
-  full_name.append(parent->full_name().data(), scope_len);
-  full_name.append(proto.name());
-
-  if (full_name.size() > std::numeric_limits<uint16_t>::max()) {
-    AddError(full_name, proto, DescriptorPool::ErrorCollector::NAME,
-             "Name too long.");
-  }
-
-  result->all_names_ =
-      alloc.AllocateStrings(proto.name(), std::move(full_name));
+  const absl::string_view scope = (parent->containing_type() == nullptr)
+                                      ? file_->package()
+                                      : parent->containing_type()->full_name();
+  result->all_names_.SetPayload(
+      AllocateNameStrings(scope, proto.name(), proto, alloc));
   result->number_ = proto.number();
   result->type_ = parent;
 

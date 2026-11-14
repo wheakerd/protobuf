@@ -64,6 +64,7 @@
 #include "google/protobuf/descriptor_test_utils.h"
 #include "google/protobuf/dynamic_message.h"
 #include "google/protobuf/feature_resolver.h"
+#include "google/protobuf/generated_enum_reflection.h"
 #include "google/protobuf/internal_feature_helper.h"
 #include "google/protobuf/io/coded_stream.h"
 #include "google/protobuf/io/tokenizer.h"
@@ -1913,6 +1914,116 @@ TEST_F(DescriptorTest, AbslStringifyWorks) {
   EXPECT_THAT(absl::StrFormat("%v", *message_),
               HasSubstr(message_->full_name()));
   EXPECT_THAT(absl::StrFormat("%v", *foo_), HasSubstr(foo_->name()));
+}
+
+TEST_F(DescriptorTest, EnumValueNamesAndLazyStringStability) {
+  DescriptorPool pool;
+  pool.AllowUnknownDependencies();
+  FileDescriptorProto file;
+  ASSERT_TRUE(TextFormat::ParseFromString(
+      R"pb(
+        name: "enum_names.proto"
+        package: "pkg.sub"
+        enum_type {
+          name: "TopEnum"
+          options { allow_alias: true }
+          value { name: "TOP_ZERO" number: 0 }
+          value { name: "TOP_ALIAS" number: 0 }
+          value { name: "TOP_LONG_ENUM_VALUE_NAME_EXCEEDING_SSO" number: 1000 }
+        }
+        message_type {
+          name: "Holder"
+          enum_type {
+            name: "NestedEnum"
+            value { name: "NESTED_ONE" number: 1 }
+          }
+          field {
+            name: "missing_enum"
+            number: 1
+            label: LABEL_OPTIONAL
+            type: TYPE_ENUM
+            type_name: ".missing.pkg.UnknownEnum"
+          }
+        }
+      )pb",
+      &file));
+  const FileDescriptor* built = pool.BuildFile(file);
+  ASSERT_NE(built, nullptr);
+
+  const EnumDescriptor* top = built->enum_type(0);
+  EXPECT_EQ(top->value(0)->full_name(), "pkg.sub.TOP_ZERO");
+  EXPECT_EQ(top->value(2)->full_name(),
+            "pkg.sub.TOP_LONG_ENUM_VALUE_NAME_EXCEEDING_SSO");
+  const std::string& first_ref = internal::NameOfEnum(top, 0);
+  const std::string& long_ref = internal::NameOfEnum(top, 1000);
+  EXPECT_EQ(first_ref, "TOP_ZERO");
+  EXPECT_EQ(internal::NameOfEnumAsString(top->value(1)), "TOP_ALIAS");
+  EXPECT_EQ(long_ref, "TOP_LONG_ENUM_VALUE_NAME_EXCEEDING_SSO");
+  EXPECT_EQ(&internal::NameOfEnum(top, 0), &first_ref);
+  EXPECT_EQ(&internal::NameOfEnum(top, 1000), &long_ref);
+
+  const EnumDescriptor* nested = built->message_type(0)->enum_type(0);
+  EXPECT_EQ(nested->value(0)->full_name(), "pkg.sub.Holder.NESTED_ONE");
+  EXPECT_EQ(internal::NameOfEnum(nested, 1), "NESTED_ONE");
+
+  const EnumDescriptor* placeholder =
+      built->message_type(0)->field(0)->enum_type();
+  EXPECT_EQ(placeholder->value(0)->full_name(),
+            "missing.pkg.PLACEHOLDER_VALUE");
+  EXPECT_EQ(internal::NameOfEnumAsString(placeholder->value(0)),
+            "PLACEHOLDER_VALUE");
+
+  const EnumValueDescriptor* synthetic =
+      FindValueByNumberCreatingIfUnknown(top, 42);
+  EXPECT_EQ(synthetic->full_name(),
+            "pkg.sub.TopEnum.UNKNOWN_ENUM_VALUE_TopEnum_42");
+  const std::string& synthetic_ref = internal::NameOfEnumAsString(synthetic);
+  EXPECT_EQ(synthetic_ref, "UNKNOWN_ENUM_VALUE_TopEnum_42");
+  EXPECT_EQ(&internal::NameOfEnumAsString(synthetic), &synthetic_ref);
+
+  FileDescriptorProto oversized;
+  oversized.set_name("oversized_enum_value.proto");
+  oversized.set_package("pkg");
+  EnumDescriptorProto* huge_enum = oversized.add_enum_type();
+  huge_enum->set_name("HugeEnum");
+  EnumValueDescriptorProto* huge_val = huge_enum->add_value();
+  huge_val->set_name(std::string(65533, 'A'));
+  huge_val->set_number(0);
+  EXPECT_EQ(pool.BuildFile(oversized), nullptr);
+
+  // Synthetic unknown value whose full_name exceeds 64 KiB retains exact names.
+  FileDescriptorProto near_limit;
+  near_limit.set_name("near_limit_enum.proto");
+  near_limit.set_package("pkg");
+  const std::string long_enum_name(40000, 'E');
+  EnumDescriptorProto* long_enum = near_limit.add_enum_type();
+  long_enum->set_name(long_enum_name);
+  EnumValueDescriptorProto* v0 = long_enum->add_value();
+  v0->set_name("ZERO");
+  v0->set_number(0);
+  const FileDescriptor* near_limit_fd = pool.BuildFile(near_limit);
+  ASSERT_NE(near_limit_fd, nullptr);
+  const EnumValueDescriptor* huge_synthetic =
+      FindValueByNumberCreatingIfUnknown(near_limit_fd->enum_type(0), 7);
+  const std::string expected_name =
+      absl::StrCat("UNKNOWN_ENUM_VALUE_", long_enum_name, "_7");
+  EXPECT_EQ(huge_synthetic->name(), expected_name);
+  EXPECT_EQ(huge_synthetic->full_name(),
+            absl::StrCat("pkg.", long_enum_name, ".", expected_name));
+  EXPECT_EQ(internal::NameOfEnumAsString(huge_synthetic), expected_name);
+
+  // Oversized placeholder enum package fails cleanly instead of dropping scope.
+  FileDescriptorProto huge_placeholder;
+  huge_placeholder.set_name("huge_placeholder.proto");
+  DescriptorProto* holder = huge_placeholder.add_message_type();
+  holder->set_name("M");
+  FieldDescriptorProto* f = holder->add_field();
+  f->set_name("e");
+  f->set_number(1);
+  f->set_label(FieldDescriptorProto::LABEL_OPTIONAL);
+  f->set_type(FieldDescriptorProto::TYPE_ENUM);
+  f->set_type_name(absl::StrCat(".", std::string(65525, 'p'), ".MissingEnum"));
+  EXPECT_EQ(pool.BuildFile(huge_placeholder), nullptr);
 }
 
 
